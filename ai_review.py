@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Code Sentinel AI Reviewer
+Code Sentinel AI Reviewer with Google Gemini
 Reads Semgrep JSON results and posts AI-generated explanations to GitHub PRs.
 """
 
@@ -8,9 +8,7 @@ import argparse
 import json
 import os
 import requests
-import sys
-
-from openai import OpenAI
+import google.generativeai as genai
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Post Semgrep results to GitHub PR with AI analysis.')
@@ -21,45 +19,43 @@ def parse_arguments():
 
 def get_ai_analysis(finding, code_snippet):
     """
-    Sends a code finding to OpenAI for analysis and returns the response.
+    Sends a code finding to Google Gemini for analysis and returns the response.
     """
-    # Initialize the OpenAI client with the API key from environment variable
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
-    prompt = f"""
-    You are a senior security engineer reviewing a code finding from a static analysis tool.
-
-    **Finding Details:**
-    - Rule: {finding['check_id']}
-    - Severity: {finding['extra']['severity']}
-    - Message: {finding['extra']['message']}
-    - File: {finding['path']}
-    - Line: {finding['start']['line']}
-
-    **Relevant Code Snippet:**
-    ```
-    {code_snippet}
-    ```
-
-    **Instructions:**
-    1. Provide a concise, easy-to-understand explanation of the vulnerability.
-    2. Explain the potential risk or impact if this code is deployed.
-    3. Provide a concrete code fix. Show the exact code change in a diff block, using '+' for added lines and '-' for removed lines.
-
-    Format your final answer using markdown.
-    """
-
     try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",  # Start with cheaper model, can upgrade to gpt-4-turbo later
-            messages=[
-                {"role": "system", "content": "You are a helpful and expert security automation assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500,
-            temperature=0.1  # Low temperature for more deterministic, focused outputs
-        )
-        return response.choices[0].message.content
+        # Configure Gemini with API key from environment variable
+        genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+        
+        # Create the model instance
+        model = genai.GenerativeModel('gemini-pro')
+        
+        prompt = f"""
+        You are a senior security engineer reviewing a code finding from a static analysis tool.
+
+        **Finding Details:**
+        - Rule: {finding['check_id']}
+        - Severity: {finding['extra']['severity']}
+        - Message: {finding['extra']['message']}
+        - File: {finding['path']}
+        - Line: {finding['start']['line']}
+
+        **Relevant Code Snippet:**
+        ```
+        {code_snippet}
+        ```
+
+        **Instructions:**
+        1. Provide a concise, easy-to-understand explanation of the vulnerability.
+        2. Explain the potential risk or impact if this code is deployed.
+        3. Provide a concrete code fix. Show the exact code change in a diff block, using '+' for added lines and '-' for removed lines.
+        4. Keep the response under 500 tokens.
+
+        Format your final answer using markdown with clear sections.
+        """
+
+        # Generate content
+        response = model.generate_content(prompt)
+        return response.text
+        
     except Exception as e:
         return f"❌ **Error getting AI analysis:** {str(e)}"
 
@@ -89,21 +85,19 @@ def main():
             semgrep_data = json.load(f)
     except FileNotFoundError:
         print(f"Error: Semgrep results file not found at {args.semgrep_file}")
-        sys.exit(1)
+        return
 
     # Get the GitHub Token from environment
     gh_token = os.environ.get("GITHUB_TOKEN")
     if not gh_token:
         print("Error: GITHUB_TOKEN environment variable is not set.")
-        sys.exit(1)
+        return
 
-    # Process each finding from Semgrep
+    # Process each finding from Semgrep (only HIGH severity/ERROR to start)
     for result in semgrep_data['results']:
-        # For simplicity, let's only process HIGH severity findings to avoid spam
-        if result['extra']['severity'] == 'ERROR':
+        if result['extra']['severity'] in ['ERROR', 'HIGH']:
 
-            # Get the code snippet from the start/end lines (simplified)
-            # In a real script, you'd use the exact file and line numbers
+            # Get the code snippet (simplified - in real use, you'd extract the actual code)
             code_snippet = f"See file: {result['path']} at line {result['start']['line']}"
 
             # Get the AI's analysis
@@ -112,7 +106,7 @@ def main():
 
             # Format the final comment
             markdown_comment = f"""
-🔍 **Code Sentinel AI Review**
+🔍 **Code Sentinel AI Review (Powered by Google Gemini)**
 
 **Rule:** `{result['check_id']}`
 **Level:** `{result['extra']['severity']}`
@@ -124,6 +118,9 @@ def main():
 
 🤖 **AI Analysis & Suggested Fix:**
 {ai_comment}
+
+---
+*This review was automatically generated by Code Sentinel.*
             """
 
             # Post the comment to GitHub
