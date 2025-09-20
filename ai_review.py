@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+Code Sentinel AI Reviewer
+Reads Semgrep JSON results and posts AI-generated explanations to GitHub PRs.
+"""
+
+import argparse
+import json
+import os
+import requests
+import sys
+
+from openai import OpenAI
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Post Semgrep results to GitHub PR with AI analysis.')
+    parser.add_argument('--semgrep-file', required=True, help='Path to the Semgrep JSON results file.')
+    parser.add_argument('--github-pr-number', required=True, help='The GitHub PR number to post to.')
+    parser.add_argument('--github-repo', required=True, help='The GitHub repository (e.g., "owner/repo").')
+    return parser.parse_args()
+
+def get_ai_analysis(finding, code_snippet):
+    """
+    Sends a code finding to OpenAI for analysis and returns the response.
+    """
+    # Initialize the OpenAI client with the API key from environment variable
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+    prompt = f"""
+    You are a senior security engineer reviewing a code finding from a static analysis tool.
+
+    **Finding Details:**
+    - Rule: {finding['check_id']}
+    - Severity: {finding['extra']['severity']}
+    - Message: {finding['extra']['message']}
+    - File: {finding['path']}
+    - Line: {finding['start']['line']}
+
+    **Relevant Code Snippet:**
+    ```
+    {code_snippet}
+    ```
+
+    **Instructions:**
+    1. Provide a concise, easy-to-understand explanation of the vulnerability.
+    2. Explain the potential risk or impact if this code is deployed.
+    3. Provide a concrete code fix. Show the exact code change in a diff block, using '+' for added lines and '-' for removed lines.
+
+    Format your final answer using markdown.
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # Start with cheaper model, can upgrade to gpt-4-turbo later
+            messages=[
+                {"role": "system", "content": "You are a helpful and expert security automation assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.1  # Low temperature for more deterministic, focused outputs
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"❌ **Error getting AI analysis:** {str(e)}"
+
+def post_github_comment(repo, pr_number, comment_body, gh_token):
+    """
+    Posts a comment to a specific GitHub Pull Request.
+    """
+    url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    data = {"body": comment_body}
+
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code != 201:
+        print(f"Failed to post comment to GitHub. Status code: {response.status_code}, Response: {response.text}")
+    return response.status_code
+
+def main():
+    args = parse_arguments()
+
+    # Read and parse the Semgrep results file
+    try:
+        with open(args.semgrep_file, 'r') as f:
+            semgrep_data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Semgrep results file not found at {args.semgrep_file}")
+        sys.exit(1)
+
+    # Get the GitHub Token from environment
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    if not gh_token:
+        print("Error: GITHUB_TOKEN environment variable is not set.")
+        sys.exit(1)
+
+    # Process each finding from Semgrep
+    for result in semgrep_data['results']:
+        # For simplicity, let's only process HIGH severity findings to avoid spam
+        if result['extra']['severity'] == 'ERROR':
+
+            # Get the code snippet from the start/end lines (simplified)
+            # In a real script, you'd use the exact file and line numbers
+            code_snippet = f"See file: {result['path']} at line {result['start']['line']}"
+
+            # Get the AI's analysis
+            print(f"Getting AI analysis for finding: {result['check_id']}")
+            ai_comment = get_ai_analysis(result, code_snippet)
+
+            # Format the final comment
+            markdown_comment = f"""
+🔍 **Code Sentinel AI Review**
+
+**Rule:** `{result['check_id']}`
+**Level:** `{result['extra']['severity']}`
+**Location:** `{result['path']}:{result['start']['line']}`
+
+**Original Message:** {result['extra']['message']}
+
+---
+
+🤖 **AI Analysis & Suggested Fix:**
+{ai_comment}
+            """
+
+            # Post the comment to GitHub
+            status = post_github_comment(args.github_repo, args.github_pr_number, markdown_comment, gh_token)
+            if status == 201:
+                print(f"Successfully posted comment for {result['check_id']}")
+            else:
+                print(f"Failed to post comment for {result['check_id']}")
+
+if __name__ == "__main__":
+    main()
